@@ -1,0 +1,161 @@
+GitHub Copilot Chat Assistant
+
+Below is a concrete, opinionated hierarchy + architectural guidance for a full‑stack, cloud‑deployed whiteboard backend (Node.js/TypeScript preferred) that integrates a MongoDB cluster and AI Studio / Gemini. I’ll explain why I recommend each choice and give an incremental (phased) plan so you can build a minimal viable system first and scale safely.
+
+High‑level summary (one line)
+- Monorepo Node.js/TypeScript with separate services: web client, API, realtime service, workers; shared libs for MongoDB cluster integration and Gemini AI client; Redis for ephemeral coordination; MongoDB Atlas (replica set/sharding) for durable state.
+
+Repository hierarchy (monorepo recommended)
+- /apps
+  - /web — React + Vite / Next.js (TS). UI, socket client, local CRDT awareness integration.
+  - /api — HTTP REST / GraphQL (Express / Fastify / Apollo) (TS). Auth, non‑realtime endpoints, metadata, team/permission management.
+  - /realtime — WebSocket server (ws or Socket.io) or a small signaling/gateway for WebRTC data channels (TS). Handles session, presence, pub/sub bridging.
+  - /worker — background worker(s) (BullMQ / RabbitMQ) for heavy tasks: AI calls, snapshot compaction, export jobs.
+- /packages
+  - /lib-db — MongoDB cluster adapter: connection, pooling, retries, healthchecks, change‑stream helpers, snapshot persistence helpers (TS).
+  - /lib-crdt — Yjs/Automerge adapter and persistence bridge to MongoDB (TS).
+  - /lib-ai — Gemini (AI Studio) client wrapper: auth, batching, streaming, rate limiting, caching (TS).
+  - /lib-auth — JWT/OAuth wrappers, permission helpers.
+  - /lib-telemetry — OpenTelemetry + metrics exporter helpers.
+  - /types — shared domain types (Board, Shape, User, Events).
+- /infrastructure
+  - /k8s — helm charts / manifests for services, HPA, ingress config.
+  - /terraform — cloud infra: VPC, managed MongoDB (Atlas), Redis (managed), Secret Manager, IAM.
+  - /deploy — Dockerfiles, CI/CD config (GitHub Actions workflows).
+- /scripts — helper dev scripts (local cluster, seed data).
+- /docs — architecture, runbook, API contracts, security.
+- .github — CI, issue templates.
+
+Why this structure
+- Monorepo simplifies sharing types and libs, reduces friction when evolving schemas across client + server.
+- Split realtime from HTTP server to scale differently and keep responsibilities clear.
+- Shared libs centralize integrations (DB, AI) so changes are localized and testable.
+
+Database cluster integration (MongoDB)
+- Use MongoDB Atlas (managed) or self‑managed replica set + shards if needed.
+- Connection details:
+  - Use DNS SRV connection string (mongodb+srv://) with TLS.
+  - Enable retryWrites=true and set sensible poolSize.
+  - Healthchecks: single lightweight read / ping endpoint.
+- Library pattern (lib-db):
+  - createClient(config): returns a singleton MongoClient with exponential backoff reconnect and metrics hooks.
+  - getDb(name) and getCollection(name) helpers with typed wrappers.
+  - changeStream helpers: watchCollection(collection, pipeline, onEvent) — using resume tokens to continue where left off.
+  - snapshot helpers: saveSnapshot(boardId, snapshotBinary, meta) and loadLatestSnapshot(boardId).
+- Data placement:
+  - Boards collection (hot), BoardSnapshots collection (periodic snapshot), Operations/Events collection (optional append log).
+  - TTL collections for presence / ephemeral sessions.
+- Why MongoDB:
+  - Flexible document model fits dynamic board content.
+  - Change Streams give a native way to react to DB writes (good for background sync / cross‑instance sync).
+  - Atlas handles ops and scaling; use sharding when write throughput & dataset size demand it.
+
+Real‑time choice & CRDT
+- Recommendation: Yjs (CRDT) + WebSocket pub/sub + Redis for cross‑instance pub/sub.
+  - Why CRDT (Yjs/Automerge):
+    - Offline edits and merge without central OT server complexity.
+    - Deterministic merges and small delta updates (efficient network usage).
+  - Why WebSockets:
+    - Low latency two‑way comms, easy to implement fallbacks.
+    - Optionally use WebRTC data channels for peer mesh later.
+- Architecture for realtime sync:
+  - Client holds local Yjs document, applies local edits, sends updates to server via WebSocket provider.
+  - Realtime service receives Yjs updates, broadcasts via Redis pub/sub to other nodes, and saves periodic snapshots to MongoDB (binary Yjs update saved as blob/BSON).
+  - Workers compacts older updates into periodic snapshots and optionally truncates operation logs.
+- Persistence:
+  - Store compact Yjs updates or full serialized Yjs state in BoardSnapshots collection to reduce replay cost.
+  - If you store ops (append log), keep quick snapshot intervals to bound recovery time.
+- Presence:
+  - Use Redis (ephemeral, low latency) for presence and awareness. Use TTL keys keyed by session.
+
+Gemini / AI Studio integration
+- Treat Gemini as a remote, rate‑limited, potentially expensive compute service.
+- Integration library (lib-ai) responsibilities:
+  - Authentication: manage API key / OAuth token via Secret Manager/Env; auto‑refresh if needed.
+  - Request wrapper: retry with exponential backoff, idempotency where possible.
+  - Streaming support: accept streaming callbacks for interactive responses.
+  - Batching: group small prompts into a batch when the model supports it to improve throughput & reduce cost.
+  - Caching & dedup: cache prompt→response for deterministic/nonprivate prompts (LRU/Redis).
+  - Cost controls: guardrails for max token lengths, per‑user quotas, background approval for large jobs.
+- Where to call AI:
+  - Lightweight in synchronous API for short prompts (with strict timeouts).
+  - Heavy or long jobs via Worker queue (BullMQ) and persist results to DB to be fetched by clients.
+- Security:
+  - Keep AI keys in Secret Manager; never push to client.
+  - Enforce per‑user quotas and audit logs for AI usage (who triggered which prompt).
+
+Data serialization pros/cons (JSON / BSON / protobuf / binary)
+- JSON
+  - Pros: human readable, easy in browser and Node, great for API payloads.
+  - Cons: verbose, no binary type for CRDT snapshots, slower parsing for large payloads.
+- BSON (Mongo native)
+  - Pros: supports binary blobs, good fit for storing Yjs snapshots / attachments.
+  - Cons: still larger than compact binary formats; not widely used outside Mongo.
+- Protobuf/FlatBuffers/MessagePack
+  - Pros: compact, fast parsing, typed schemas, great for network efficiency.
+  - Cons: schema management overhead, less convenient for quick iteration.
+- Recommendation:
+  - API payloads: JSON (with compression if needed).
+  - Persist CRDT snapshots: binary (Uint8Array) stored in Mongo as BinData (BSON) for compactness and speed.
+  - Internal pub/sub: small binary deltas or MessagePack if you need optimizations later.
+
+Initial data model sketch (collections)
+- users
+  - _id, email, displayName, hashedPassword, authProviders[], createdAt, roles
+- boards
+  - _id, ownerId, title, collaborators: [{userId, role}], createdAt, updatedAt, isPublic, metadata
+- board_snapshots
+  - _id, boardId, version, yjsSnapshot: BinData, createdAt, createdBy, seqRange {from,to}
+- board_ops (optional append log)
+  - _id, boardId, seq, op: BinData/JSON, userId, createdAt
+- sessions / presence
+  - _id, userId, boardId, socketId, lastSeen, ttl
+- ai_jobs
+  - _id, jobType, input, status, resultRef, cost, createdAt, completedAt, attemptedBy
+- Why save snapshots + optional ops:
+  - Snapshots speed recovery; ops allow auditability or incremental replays for late clients.
+
+Operational concerns
+- Secrets: Use managed Secret Manager (cloud provider) and inject at runtime; never store keys in repo.
+- Rate limiting: per‑route, per‑user. Also throttle AI usage.
+- Observability: OpenTelemetry traces, Prometheus metrics, structured logs (JSON), SLOs & alerting.
+- Backups & recovery: Atlas automated backups; snapshot retention policy; test recovery plan regularly.
+- Testing: property tests for CRDT merge behaviors, integration tests with local Mongo + Redis, end‑to‑end QA on latency.
+
+Deployment and infra (high level)
+- Use managed MongoDB (Atlas) + managed Redis (Elasticache / Memorystore) in same region(s).
+- Kubernetes (EKS/GKE/AKS) for services + HPA; use HorizontalPodAutoscaler on CPU/RPS.
+- Use a separate worker pool for long AI jobs.
+- Set up CI: build, lint, unit tests, integration tests with ephemeral DBs (or test containers).
+- Use GitHub Actions or Cloud Build pipelines with CD to staging and production clusters.
+
+Phased roadmap (practical)
+- MVP (Weeks 0–4)
+  - Single region, single Node instance for API + WS (monolith to start).
+  - Use MongoDB Atlas single‑replica or small replica set, Redis single instance.
+  - Client + server CRDT sync using Yjs direct persistence to Mongo snapshots every N seconds.
+  - Basic auth + ACL, simple AI integration (sync small prompts).
+- Phase 2 (Scale)
+  - Split realtime into its own service, add Redis pub/sub to coordinate nodes.
+  - Run multiple replicas behind LB; enable HPA.
+  - Add workers for AI tasks, snapshot compaction, export.
+  - Add change streams for background indexing / notifications.
+- Phase 3 (Resilience & Global)
+  - Multi‑region read replicas, sharded Mongo if needed, regional caches.
+  - Robust rate limiting, quotas, billing integration.
+  - Advanced features: offline sync, CRDT persistence optimization, model orchestration (mix of LLMs).
+- Phase 4 (Optimization)
+  - Binary protocol between client and server, protobuf for internal RPC, optimize snapshot sizes, add dedup/caching for AI.
+
+Concrete examples (conceptual code patterns)
+- Mongo client wrapper (concept)
+  - export async function connectMongo(uri) { /* singleton, retry/backoff, set poolSize, tls, event handlers for monitoring */ }
+  - export function getCollection(name) { return client.db(DB).collection(name); }
+- Gemini wrapper (concept)
+  - class GeminiClient { constructor({apiKey}) {...} async predict(prompt, opts) { /* validate, rate-limit, retry, stream support */ } }
+
+
+
+
+
+
